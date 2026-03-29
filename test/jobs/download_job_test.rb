@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "base64"
 require "bencode"
 require "digest/sha1"
 
@@ -23,6 +24,7 @@ class DownloadJobTest < ActiveJob::TestCase
 
     # Clear qBittorrent sessions
     Thread.current[:qbittorrent_sessions] = {}
+    Thread.current[:transmission_protocols] = {}
 
     # Create a queued download
     @download = @request.downloads.create!(
@@ -109,10 +111,26 @@ class DownloadJobTest < ActiveJob::TestCase
       enabled: true
     )
     Thread.current[:transmission_sessions] = {}
+    Thread.current[:transmission_protocols] = {}
+    torrent_data = {
+      "info" => {
+        "name" => "Transmission Book.epub",
+        "piece length" => 16384,
+        "pieces" => "s" * 20,
+        "length" => 512
+      }
+    }.bencode
+    @selected_result.update!(download_url: "http://prowlarr:9696/api/v1/indexer/download/123")
 
     VCR.turned_off do
       stub_request(:post, "http://localhost:9091/transmission/rpc")
-        .with(body: /"method"\s*:\s*"session-get"/)
+        .with do |request|
+          body = JSON.parse(request.body)
+          body["jsonrpc"] == "2.0" &&
+            body["method"] == "session_get" &&
+            body["params"] == {} &&
+            body["id"] == 1
+        end
         .to_return(
           {
             status: 409,
@@ -122,26 +140,41 @@ class DownloadJobTest < ActiveJob::TestCase
           {
             status: 200,
             headers: { "Content-Type" => "application/json" },
-            body: { "result" => "success", "arguments" => {} }.to_json
+            body: { "jsonrpc" => "2.0", "result" => { "version" => "4.1.1" }, "id" => 1 }.to_json
           }
         )
-      stub_request(:post, "http://localhost:9091/transmission/rpc")
-        .with(body: /"method"\s*:\s*"torrent-get"/)
+      stub_request(:get, "http://prowlarr:9696/api/v1/indexer/download/123")
         .to_return(
           status: 200,
-          headers: { "Content-Type" => "application/json" },
-          body: { "result" => "success", "arguments" => { "torrents" => [] } }.to_json
+          headers: { "Content-Type" => "application/x-bittorrent" },
+          body: torrent_data
         )
       stub_request(:post, "http://localhost:9091/transmission/rpc")
         .with do |request|
           body = JSON.parse(request.body)
-          body["method"] == "torrent-add" &&
-            body["arguments"]["filename"] == "http://example.com/download/test.torrent"
+          body["jsonrpc"] == "2.0" &&
+            body["method"] == "torrent_get" &&
+            body["params"] == { "ids" => "all", "fields" => [ "hash_string" ] } &&
+            body["id"] == 1
         end
         .to_return(
           status: 200,
           headers: { "Content-Type" => "application/json" },
-          body: { "result" => "success", "arguments" => { "torrent-added" => { "hashString" => "transmission-hash" } } }.to_json
+          body: { "jsonrpc" => "2.0", "result" => { "torrents" => [] }, "id" => 1 }.to_json
+        )
+      stub_request(:post, "http://localhost:9091/transmission/rpc")
+        .with do |request|
+          body = JSON.parse(request.body)
+          body["jsonrpc"] == "2.0" &&
+            body["method"] == "torrent_add" &&
+            body["params"]["metainfo"] == Base64.strict_encode64(torrent_data) &&
+            !body["params"].key?("filename") &&
+            body["id"] == 1
+        end
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "jsonrpc" => "2.0", "result" => { "torrent_added" => { "hash_string" => "transmission-hash" } }, "id" => 1 }.to_json
         )
 
       DownloadJob.perform_now(@download.id)
