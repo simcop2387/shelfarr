@@ -7,6 +7,7 @@ class SearchResultTest < ActiveSupport::TestCase
     @pending_result = search_results(:pending_result)
     @selected_result = search_results(:selected_result)
     @no_link_result = search_results(:no_link_result)
+    Setting.where(key: %w[preferred_download_types preferred_download_type]).delete_all
   end
 
   # === Validations ===
@@ -67,6 +68,62 @@ class SearchResultTest < ActiveSupport::TestCase
     assert_equal low_seeders, ordered[3]
   end
 
+  test "best_first respects ordered download type preferences" do
+    request = requests(:pending_request)
+    request.search_results.destroy_all
+
+    direct_result = request.search_results.create!(
+      guid: "direct",
+      title: "Direct result",
+      source: SearchResult::SOURCE_ANNA_ARCHIVE,
+      confidence_score: 80
+    )
+    usenet_result = request.search_results.create!(
+      guid: "usenet",
+      title: "Usenet result",
+      download_url: "http://example.com/download/test.nzb",
+      confidence_score: 80
+    )
+    torrent_result = request.search_results.create!(
+      guid: "torrent",
+      title: "Torrent result",
+      magnet_url: "magnet:?xt=urn:btih:torrent",
+      confidence_score: 80
+    )
+
+    SettingsService.set(:preferred_download_types, %w[direct usenet torrent])
+
+    assert_equal [direct_result, usenet_result, torrent_result], request.search_results.best_first.to_a
+  end
+
+  test "best_first falls back to legacy preferred download type" do
+    request = requests(:pending_request)
+    request.search_results.destroy_all
+
+    usenet_result = request.search_results.create!(
+      guid: "legacy-usenet",
+      title: "Legacy Usenet result",
+      download_url: "http://example.com/download/test.nzb",
+      confidence_score: 80
+    )
+    torrent_result = request.search_results.create!(
+      guid: "legacy-torrent",
+      title: "Legacy Torrent result",
+      magnet_url: "magnet:?xt=urn:btih:torrent",
+      confidence_score: 80
+    )
+
+    Setting.create!(
+      key: "preferred_download_type",
+      value: "usenet",
+      value_type: "string",
+      category: "download",
+      description: "Legacy preferred download type"
+    )
+
+    assert_equal [usenet_result, torrent_result], request.search_results.best_first.to_a
+  end
+
   # === Methods ===
 
   test "downloadable? returns true when magnet_url present" do
@@ -113,5 +170,25 @@ class SearchResultTest < ActiveSupport::TestCase
   test "size_human returns nil when no size" do
     result = SearchResult.new
     assert_nil result.size_human
+  end
+
+  test "format helper methods read score breakdown metadata" do
+    result = SearchResult.new(
+      score_breakdown: {
+        extension: "m4b",
+        extensions: [ "m4b" ],
+        audiobook_structure: "single_file",
+        audio_bitrate_kbps: 192,
+        auto_select_allowed: false,
+        preference_adjustment: 12
+      }
+    )
+
+    assert_equal "m4b", result.primary_extension
+    assert_equal [ "m4b" ], result.detected_extensions
+    assert_equal :single_file, result.audiobook_structure
+    assert_equal 192, result.audio_bitrate_kbps
+    refute result.auto_select_allowed_by_preferences?
+    assert_equal 12, result.preference_adjustment
   end
 end

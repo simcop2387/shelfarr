@@ -20,12 +20,17 @@ class SearchResult < ApplicationRecord
   scope :selectable, -> { pending }
 
   scope :preferred_first, -> {
-    preferred = SettingsService.get(:preferred_download_type, default: "torrent")
-    if preferred == "usenet"
-      order(Arel.sql("CASE WHEN download_url IS NOT NULL AND magnet_url IS NULL AND seeders IS NULL THEN 0 ELSE 1 END"))
-    else
-      order(Arel.sql("CASE WHEN magnet_url IS NOT NULL THEN 0 ELSE 1 END"))
-    end
+    ordered_types = SettingsService.preferred_download_types
+    type_order_sql = ordered_types.each_with_index.map { |type, index| "WHEN '#{type}' THEN #{index}" }.join(" ")
+    download_type_sql = <<~SQL.squish
+      CASE
+        WHEN source = '#{SOURCE_ANNA_ARCHIVE}' THEN 'direct'
+        WHEN download_url IS NOT NULL AND magnet_url IS NULL AND seeders IS NULL THEN 'usenet'
+        ELSE 'torrent'
+      END
+    SQL
+
+    order(Arel.sql("CASE #{download_type_sql} #{type_order_sql} ELSE #{ordered_types.length} END"))
   }
 
   scope :best_first, -> { preferred_first.order(confidence_score: :desc, seeders: :desc, size_bytes: :asc) }
@@ -65,6 +70,18 @@ class SearchResult < ApplicationRecord
   # Check if this is a torrent result
   def torrent?
     magnet_url.present? || (download_url.present? && !usenet?)
+  end
+
+  def direct_download?
+    from_anna_archive?
+  end
+
+  def download_type
+    return "direct" if direct_download?
+    return "usenet" if usenet?
+    return "torrent" if torrent?
+
+    nil
   end
 
   def size_human
@@ -126,6 +143,35 @@ class SearchResult < ApplicationRecord
     end
   end
 
+  def primary_extension
+    score_detail(:extension).presence
+  end
+
+  def detected_extensions
+    Array(score_detail(:extensions)).map(&:to_s)
+  end
+
+  def audiobook_structure
+    structure = score_detail(:audiobook_structure)
+    structure&.to_sym
+  end
+
+  def audio_bitrate_kbps
+    bitrate = score_detail(:audio_bitrate_kbps)
+    bitrate.present? ? bitrate.to_i : nil
+  end
+
+  def auto_select_allowed_by_preferences?
+    auto_select_allowed = score_detail(:auto_select_allowed)
+    return auto_select_allowed unless auto_select_allowed.nil?
+
+    FormatPreferenceService.evaluate(title: title, book_type: request&.book&.book_type).auto_select_allowed
+  end
+
+  def preference_adjustment
+    score_detail(:preference_adjustment).to_i
+  end
+
   # Source helpers
   def from_prowlarr?
     source == SOURCE_PROWLARR || source.blank?
@@ -152,5 +198,16 @@ class SearchResult < ApplicationRecord
     else
       indexer.presence || "Prowlarr"
     end
+  end
+
+  private
+
+  def score_detail(key)
+    return nil unless score_breakdown.is_a?(Hash)
+
+    return score_breakdown[key.to_s] if score_breakdown.key?(key.to_s)
+    return score_breakdown[key.to_sym] if score_breakdown.key?(key.to_sym)
+
+    nil
   end
 end

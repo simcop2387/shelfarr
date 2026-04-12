@@ -1,4 +1,20 @@
 class SettingsService
+  DOWNLOAD_TYPES = %w[torrent usenet direct].freeze
+  DOWNLOAD_TYPE_OPTIONS = {
+    "torrent" => {
+      label: "Torrent",
+      description: "Tracker and magnet-link releases"
+    },
+    "usenet" => {
+      label: "Usenet",
+      description: "NZB releases sent to a usenet client"
+    },
+    "direct" => {
+      label: "Direct",
+      description: "Integration downloads such as Anna's Archive"
+    }
+  }.freeze
+
   # Define all expected settings with their defaults and types
   DEFINITIONS = {
     # Indexer Integration
@@ -11,7 +27,7 @@ class SettingsService
     jackett_indexer_filter: { type: "string", default: "all", category: "indexer", description: "Jackett indexer filter for Torznab queries. Use 'all' for every indexer, or a specific Jackett filter such as 'tag:books'." },
 
     # Download Settings (clients are now managed separately via Admin > Download Clients)
-    preferred_download_type: { type: "string", default: "torrent", category: "download", description: "Preferred download type when both available (torrent or usenet)" },
+    preferred_download_types: { type: "json", default: '["torrent","usenet","direct"]', category: "download", description: "Download types in preference order. Higher-ranked types are preferred when multiple result types are available." },
     download_check_interval: { type: "integer", default: 60, category: "download", description: "Seconds between download status checks" },
     download_enqueue_timeout_minutes: { type: "integer", default: 5, category: "download", description: "Minutes a download may stay queued in Shelfarr before being flagged as never dispatched to the download client" },
     remove_completed_usenet_downloads: { type: "boolean", default: true, category: "download", description: "Remove usenet downloads from client after successful import" },
@@ -55,6 +71,16 @@ class SettingsService
     auto_select_min_seeders: { type: "integer", default: 1, category: "auto_select", description: "Minimum seeders required for auto-selection (torrent only)" },
     auto_select_confidence_threshold: { type: "integer", default: 90, category: "auto_select", description: "Minimum confidence score (0-100) for auto-selection" },
 
+    # Format Preferences
+    ebook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that may be auto-selected (leave blank to allow any detected format)" },
+    ebook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that should never be auto-selected" },
+    ebook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats in preference order, from best to worst" },
+    audiobook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that may be auto-selected (leave blank to allow any detected format)" },
+    audiobook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that should never be auto-selected" },
+    audiobook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats in preference order, from best to worst" },
+    audiobook_prefer_single_file: { type: "boolean", default: false, category: "format_preferences", description: "Prefer single-file audiobook releases (for example .m4b) over chapter-split releases when detected" },
+    audiobook_prefer_higher_bitrate: { type: "boolean", default: false, category: "format_preferences", description: "Prefer higher bitrate audiobook releases when the bitrate can be inferred from the title" },
+
     # Language Settings
     default_language: { type: "string", default: "en", category: "language", description: "Default language for new requests" },
     enabled_languages: { type: "json", default: '["en"]', category: "language", description: "Languages available for selection when creating requests" },
@@ -90,6 +116,7 @@ class SettingsService
 
     # OIDC/SSO Authentication
     oidc_enabled: { type: "boolean", default: false, category: "oidc", description: "Enable OpenID Connect (OIDC) single sign-on authentication" },
+    oidc_auto_redirect: { type: "boolean", default: false, category: "oidc", description: "Automatically start OIDC sign-in for unauthenticated users. Use /session/new?local=1 to access the local login form." },
     oidc_provider_name: { type: "string", default: "SSO", category: "oidc", description: "Display name for the OIDC provider (shown on login button)" },
     oidc_issuer: { type: "string", default: "", category: "oidc", description: "OIDC issuer URL (e.g., https://auth.example.com/realms/master)" },
     oidc_client_id: { type: "string", default: "", category: "oidc", description: "OIDC client ID from your identity provider" },
@@ -110,6 +137,7 @@ class SettingsService
     "open_library" => "Open Library",
     "health" => "Health Monitoring",
     "auto_select" => "Auto-Selection",
+    "format_preferences" => "Format Preferences",
     "language" => "Language & Matching",
     "updates" => "Updates",
     "security" => "Security",
@@ -121,17 +149,13 @@ class SettingsService
     # Primary getter with default fallback
     def get(key, default: nil)
       key = key.to_sym
+      return preferred_download_types if key == :preferred_download_types
+
+      value = raw_setting_value(key)
+      return value unless value.nil?
+
       definition = DEFINITIONS[key]
-
-      setting = Setting.find_by(key: key.to_s)
-
-      if setting
-        setting.typed_value
-      elsif definition
-        definition[:default]
-      else
-        default
-      end
+      definition ? definition[:default] : default
     end
 
     # Primary setter
@@ -245,6 +269,12 @@ class SettingsService
         configured?(:oidc_client_secret)
     end
 
+    def oidc_auto_redirect?
+      oidc_configured? &&
+        !auth_disabled? &&
+        get(:oidc_auto_redirect, default: false)
+    end
+
     def hardcover_configured?
       configured?(:hardcover_api_token)
     end
@@ -270,6 +300,71 @@ class SettingsService
 
     def auto_approve_requests?
       get(:auto_approve_requests, default: false)
+    end
+
+    def preferred_download_types
+      stored_preferred_types = Setting.find_by(key: "preferred_download_types")&.typed_value
+      ordered_types = normalize_download_types(stored_preferred_types)
+
+      if ordered_types.empty?
+        legacy_type = normalize_download_types(Setting.find_by(key: "preferred_download_type")&.typed_value).first
+        ordered_types = legacy_type ? [ legacy_type ] : []
+      end
+
+      ordered_types + (DOWNLOAD_TYPES - ordered_types)
+    end
+
+    def download_type_options
+      preferred_download_types.map do |type|
+        DOWNLOAD_TYPE_OPTIONS.fetch(type)
+          .merge(value: type)
+      end
+    end
+
+    def format_preferences_for(book_type)
+      type = book_type.to_s
+      return default_format_preferences unless %w[audiobook ebook].include?(type)
+
+      {
+        approved_formats: normalized_list_setting("#{type}_approved_formats"),
+        rejected_formats: normalized_list_setting("#{type}_rejected_formats"),
+        preferred_formats: normalized_list_setting("#{type}_preferred_formats"),
+        prefer_single_file: type == "audiobook" && get(:audiobook_prefer_single_file, default: false),
+        prefer_higher_bitrate: type == "audiobook" && get(:audiobook_prefer_higher_bitrate, default: false)
+      }
+    end
+
+    private
+
+    def raw_setting_value(key)
+      setting = Setting.find_by(key: key.to_s)
+      return setting.typed_value if setting
+
+      DEFINITIONS[key.to_sym]&.dig(:default)
+    end
+
+    def normalize_download_types(values)
+      Array(values).filter_map do |value|
+        normalized = value.to_s.strip.downcase
+        normalized if DOWNLOAD_TYPES.include?(normalized)
+      end.uniq
+    end
+
+    def normalized_list_setting(key)
+      Array(get(key)).filter_map do |value|
+        normalized = value.to_s.strip.downcase
+        normalized.presence
+      end.uniq
+    end
+
+    def default_format_preferences
+      {
+        approved_formats: [],
+        rejected_formats: [],
+        preferred_formats: [],
+        prefer_single_file: false,
+        prefer_higher_bitrate: false
+      }
     end
   end
 end
